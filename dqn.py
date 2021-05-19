@@ -14,6 +14,9 @@ EXPLORATION_STEPS = 1000000 #εの減少フレーム数
 STATE_LENGTH = 4    # 状態を構成するフレーム数
 FRAME_WIDTH = 84    # リサイズ後のフレーム幅
 FRAME_HEIGHT = 84   #　リサイズ後のフレーム高さ
+LEARNING_RATE = 0.00025     #RMSPropで使われる学習率
+MOMENTUM = 0.95     #RMSPropで使われるモメンタム
+MIN_GRAD = 0.01     #RMSPropで使われる0で割るのを防ぐための値
 
 #Agentクラス アルゴリズムが書かれてるクラス
 
@@ -69,12 +72,26 @@ class Agent():
 
     #最適化の処理(エラークリップ)
     def build_training_op(self, q_network_wights):
-        pass
+        a = tf.placeholder(tf.int64, [None])    #行動
+        y = tf.placeholder(tf.float32, [None])  #教師信号 r + γQ(s', a':θ)
+
+        a_one_hot = tf.one_hot(a, self.num_actions, 1.0, 0.0)   #行動をone hot vectorに変換 num_actions次元のone hot vectorに変換
+        q_value = tf.reduce_sum(tf.mul(self.q_values, a_one_hot), reduction_indices=1)  #行動のQ値の計算 self.q_values * a_one_hot して 要素全て足し算(q_value以外全部0なのでq_valueが取り出される)
+
+        #エラークリップ TODO:最適化アルゴリズムとかよくわかってない
+        error = tf.abs(y - q_value)     #|y-q_value|?
+        quadratic_part = tf.clip_by_value(error, 0.0, 1.0)
+        linear_part = error - quadratic_part
+        loss = tf.reduce_mean(0.5 * tf.square(quadratic_part) + linear_part) #誤差関数
+
+        optimizer = tf.train.RMSPropOptimizer(LEARNING_RATE, momentum=MOMENTUM, epsilon=MIN_GRAD)   #最適化アルゴリズムの定義
+        grad_update = optimizer.minimize(loss, var_list=q_network_wights)   #誤差最小化
+
+        return a, y, loss, grad_update
 
 
 
-
-#↓大枠
+#大枠
 
 env = gym.make(ENV_NAME)
 agent = Agent(num_actions=env.action_space.n)
