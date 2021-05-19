@@ -3,6 +3,10 @@ import tensorflow as tf
 from keras.models import Sequential
 from keras.layers import Convolution2D, Flatten, Dense
 from collections import deque
+import numpy as np
+from skimage.color import rgb2gray
+from skimage.transform import resize
+import random
 
 #変数
 ENV_NAME = 'Breakout-v0'
@@ -12,11 +16,13 @@ INITIAL_EPSILON = 1.0 #ε-greedy法のε初期値
 FINAL_EPSILON = 0.1 #εの終値
 EXPLORATION_STEPS = 1000000 #εの減少フレーム数
 STATE_LENGTH = 4    # 状態を構成するフレーム数
-FRAME_WIDTH = 84    # リサイズ後のフレーム幅
+FRAME_WIDTH = 84    # リサイズ後のフレーム幅数
 FRAME_HEIGHT = 84   #　リサイズ後のフレーム高さ
 LEARNING_RATE = 0.00025     #RMSPropで使われる学習率
 MOMENTUM = 0.95     #RMSPropで使われるモメンタム
 MIN_GRAD = 0.01     #RMSPropで使われる0で割るのを防ぐための値
+ACTION_INTERVAL = 4     #フレームスキップ数  Atariでは1秒間に60回画面が更新 全部の更新を見るのは効率が悪いため4フレームに1回画面をみて行動選択
+INITIAL_REPLAY_SIZE = 20000 #学習前に事前に確保するReplay Memory数
 
 #Agentクラス アルゴリズムが書かれてるクラス
 
@@ -89,6 +95,30 @@ class Agent():
 
         return a, y, loss, grad_update
 
+    #エピソード開始時　初期状態を生成する関数
+    def get_initial_state(self, observation, last_observation):
+        processed_observation = np.maximum(observation, last_observation)   #現在のゲーム画面と前画面のピクセルごとから、最大値を抽出
+        processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT))*255) #グレースケール変換　ゲーム画面を84*84にリサイズ
+        state = [processed_observation for _ in xrange(STATE_LENGTH)]
+        return np.stack(state, axis=0)
+
+    #行動を選択する関数
+    def get_action(self, state):
+        action = self.repeated_action   #スキップするフレーム間に起こす行動リピート
+
+        #ACTION_INTERVAL間隔で行動選択(それ以外は行動リピート) self.t = time？
+        if self.t % ACTION_INTERVAL == 0:
+            if self.epsilon >= random.random() or self.t < INITIAL_REPLAY_SIZE:
+                action = random.randrange(self.num_actions) #ランダムに行動を選択　ε-greedy法の自由探索のほう
+            else:
+                action = np.argmax(self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]})) #Q値が最も高い行動を選択 sにnp.float32(state / 255.0)を送ってQ値を計算？
+            self.repeated_action = action
+
+        #εを線形に減少させる
+        if self.epsilon > FINAL_EPSILON and self.t >= INITIAL_REPLAY_SIZE:
+            self.epsilon -= self.epsilon_step
+
+        return action
 
 
 #大枠
