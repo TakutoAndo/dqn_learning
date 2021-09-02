@@ -1,13 +1,19 @@
 import os
 import gym
-import tensorflow as tf
-from keras.models import Sequential
-from keras.layers import Convolution2D, Flatten, Dense
+import sys
+
+from keras.backend_config import epsilon
+from numpy.core.fromnumeric import resize
+import random
 from collections import deque
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+from keras.models import Sequential
+from keras.layers import Conv2D, Flatten, Dense
 import numpy as np
 from skimage.color import rgb2gray
 from skimage.transform import resize
-import random
+
 
 #変数
 ENV_NAME = 'Breakout-v0'
@@ -43,123 +49,120 @@ class Agent():
     def __init__(self, num_actions):
         self.num_actions = num_actions
         self.epsilon = INITIAL_EPSILON
-        self.epsilon_step = (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORATION_STEPS #εの減少率
-        self.time_step = 0
-        self.repeated_action = 0 #フレームスキップ間にリピートする行動を保持するための変数
+        self.epsilon_step = (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORATION_STEPS
+        self.time = 0
+        self.repeated_action = 0 #フレームスキップ時にリピートする行動を保持するための変数
 
-        #summaryで使う値の初期化
+        #Replay Memoryをデクで実装・初期化
+        self.replay_memory = deque()
+
+
+        """データ解析で使う値"""
         self.total_reward = 0
         self.total_q_max = 0
         self.total_loss = 0
         self.duration = 0
         self.episode = 0
 
-        #Replay Memoryの初期化
-        self.replay_memory = deque()
-
-        #Q Networkの構築
+        #Q-Networkの構築
         self.s, self.q_values, q_network = self.build_network()
         q_network_weights = q_network.trainable_weights
 
-        #Target Networkの構築
+        #Target-Networkの構築
         self.st, self.target_q_values, target_network = self.build_network()
         target_network_weights = target_network.trainable_weights
 
-        #定期的なTargetNetworkの更新処理
-        self.update_target_network = [target_network_weights[i].assign(q_network_weights[i]) for i in xrange(len(target_network_weights))]
+        #定期的なTarget-Networkの更新処理
+        self.update_target_network = [target_network_weights[i].assign(q_network_weights[i]) for i in range(len(target_network_weights))]
 
         #誤差関数、最適化のための処理の構築
-        self.a, self.y, self.loss, self.grad_update = self.build_training_op(q_network_weights)
+        self.action, self.training_data, self.loss, self.grad_update = self.error_clip(q_network_weights)
 
-        #Sessionの構築
+        #FIXME: Sessionの構築　理解すること
         self.sess = tf.InteractiveSession()
-        self.saver  =tf.train.Saver(q_network_weights)
+        self.saver = tf.train.Saver(q_network_weights)
         self.summary_placeholders, self.update_ops, self.summary_op = self.setup_summary()
-        self.summary_writer  =tf.train.SummaryWriter(SAVE_SUMMARY_PATH, self.sess.graph)
+        self.summary_writer = tf.summary.FileWriter(SAVE_SUMMARY_PATH, self.sess.graph)
 
+        #ネットワークの保存場所がなければ作成
         if not os.path.exists(SAVE_NETWORK_PATH):
             os.makedirs(SAVE_NETWORK_PATH)
 
-        #変数の初期化(Q Networkの初期化)
+        #Q-Networkの初期化
         self.sess.run(tf.initialize_all_variables())
 
         #Networkのロード
         if LOAD_NETWORK:
-            self.load_network()
+            print("Network is loading ...")
 
-        #Target Networkの初期化
+        #TargetNetworkの初期化
         self.sess.run(self.update_target_network)
 
-    #Q Network と Target Network の構築関数
     def build_network(self):
         model = Sequential()
-        model.add(Convolution2D(32, 8, 8, subsample=(4, 4), activation='relu', input_shape=(STATE_LENGTH, FRAME_WIDTH, FRAME_HEIGHT)))
-        model.add(Convolution2D(64, 4, 4, subsample=(2, 2), activation='relu'))
-        model.add(Convolution2D(64, 3, 3, subsample=(1, 1), activation='relu'))
+        model.add(Conv2D(32, (8, 8), strides=(4, 4), activation='relu', input_shape=(FRAME_WIDTH, FRAME_HEIGHT, STATE_LENGTH)))
+        model.add(Conv2D(64, (4, 4), strides=(2, 2), activation='relu'))
+        model.add(Conv2D(64, (3, 3), strides=(1, 1), activation='relu'))
         model.add(Flatten())
         model.add(Dense(512, activation='relu'))
         model.add(Dense(self.num_actions))
 
-        #TODO: ここ２行の理解
-        s = tf.placeholder(tf.float32, [None, STATE_LENGTH, FRAME_WIDTH, FRAME_HEIGHT])
+        s = tf.placeholder(tf.float32, [None, FRAME_WIDTH, FRAME_HEIGHT, STATE_LENGTH])
         q_values = model(s)
 
         return s, q_values, model
 
-    #最適化の処理(エラークリップ)
-    def build_training_op(self, q_network_wights):
-        a = tf.placeholder(tf.int64, [None])    #行動
-        y = tf.placeholder(tf.float32, [None])  #教師信号 r + γQ(s', a':θ)
+    #エラー(target - Q(s, a; θ))を-1~1でクリップする
+    def error_clip(self, q_network_wights):
+        action = tf.placeholder(tf.int64, [None])
+        training_data = tf.placeholder(tf.float32, [None])
 
-        a_one_hot = tf.one_hot(a, self.num_actions, 1.0, 0.0)   #行動をone hot vectorに変換 num_actions次元のone hot vectorに変換
-        q_value = tf.reduce_sum(tf.mul(self.q_values, a_one_hot), reduction_indices=1)  #行動のQ値の計算 self.q_values * a_one_hot して 要素全て足し算(q_value以外全部0なのでq_valueが取り出される)
+        action_onehot = tf.one_hot(action, self.num_actions, 0.0, 1.0)
+        q_value = tf.reduce_sum(tf.multiply(self.q_values, action_onehot), reduction_indices=1)
 
-        #エラークリップ TODO:最適化アルゴリズムとかよくわかってない
-        error = tf.abs(y - q_value)     #|y-q_value|?
+        error = tf.abs(training_data - q_value)
         quadratic_part = tf.clip_by_value(error, 0.0, 1.0)
-        linear_part = error - quadratic_part
-        loss = tf.reduce_mean(0.5 * tf.square(quadratic_part) + linear_part) #誤差関数
+        liner_part = error - quadratic_part
+        loss = tf.reduce_mean(0.5 * tf.square(quadratic_part) + liner_part)
 
-        optimizer = tf.train.RMSPropOptimizer(LEARNING_RATE, momentum=MOMENTUM, epsilon=MIN_GRAD)   #最適化アルゴリズムの定義
-        grad_update = optimizer.minimize(loss, var_list=q_network_wights)   #誤差最小化
+        optimizer = tf.train.RMSPropOptimizer(LEARNING_RATE, momentum=MOMENTUM, epsilon=MIN_GRAD)
+        grad_update = optimizer.minimize(loss, var_list=q_network_wights)
 
-        return a, y, loss, grad_update
+        return action, training_data, loss, grad_update
 
-    #エピソード開始時　初期状態を生成する関数
     def get_initial_state(self, observation, last_observation):
-        processed_observation = np.maximum(observation, last_observation)   #現在のゲーム画面と前画面のピクセルごとから、最大値を抽出
-        processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT))*255) #グレースケール変換　ゲーム画面を84*84にリサイズ
-        state = [processed_observation for _ in xrange(STATE_LENGTH)]
-        return np.stack(state, axis=0)
+        processed_observation = np.maximum(observation, last_observation)
+        processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT), mode="constant") * 255)
+        state = [processed_observation for _ in range(STATE_LENGTH)]
+        return np.stack(state, axis=2)
 
-    #行動を選択する関数
     def get_action(self, state):
-        action = self.repeated_action   #スキップするフレーム間に起こす行動リピート
+        #FIXME フレームスキップは有効？？
+        action = self.repeated_action
 
-        #ACTION_INTERVAL間隔で行動選択(それ以外は行動リピート) self.t = time？
-        if self.t % ACTION_INTERVAL == 0:
-            if self.epsilon >= random.random() or self.t < INITIAL_REPLAY_SIZE: #最初のreplay_memory作成時はランダムな行動をする
-                action = random.randrange(self.num_actions) #ランダムに行動を選択　ε-greedy法の自由探索のほう
+        #ACTION_INTERVAL間隔で行動選択を行う（それ以外では行動をリピート）
+        if self.time % ACTION_INTERVAL == 0:
+            if self.epsilon >= random.random() or self.time < INITIAL_REPLAY_SIZE:
+                action = random.randrange(self.num_actions)
             else:
-                action = np.argmax(self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]})) #Q値が最も高い行動を選択 sにnp.float32(state / 255.0)を送ってQ値を計算？
+                print(f"q_values.eval in get_action(): {self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]})}")
+                action = np.argmax(self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]}))
             self.repeated_action = action
 
         #εを線形に減少させる
-        if self.epsilon > FINAL_EPSILON and self.t >= INITIAL_REPLAY_SIZE:
+        if self.epsilon > FINAL_EPSILON and self.time >= INITIAL_REPLAY_SIZE:
             self.epsilon -= self.epsilon_step
 
         return action
 
-    #TODO: 結構わからん
     def train_network(self):
         state_batch = []
         action_batch = []
         reward_batch = []
         next_state_batch = []
         terminal_batch = []
-        y_batch = []
+        training_data_batch = []
 
-        # Replay Memoryからランダムにミニバッチをサンプリング
         minibatch = random.sample(self.replay_memory, BATCH_SIZE)
         for data in minibatch:
             state_batch.append(data[0])
@@ -168,18 +171,13 @@ class Agent():
             next_state_batch.append(data[3])
             terminal_batch.append(data[4])
 
-        #終了判定をTrueは1に、Falseは0に変換
         terminal_batch = np.array(terminal_batch) + 0
+        #target_networkで次の状態のQ値を計算
+        target_q_values_batch = self.target_q_values.eval(feed_dict={self.st: np.float32(np.array(next_state_batch) / 255.0)})
+        training_data_batch = reward_batch + (1 - terminal_batch) * GAMMA * np.max(target_q_values_batch, axis=1)
 
-        target_q_values_batch = self.target_q_values.eval(feed_dict={self.st: np.float32(np.array(next_state_batch) / 255.0)})  #Target NetWorkで次の状態のQ値を計算
-        y_batch = reward_batch + (1 - terminal_batch) * GAMMA * np.max(target_q_values_batch, axis=1)   #教師信号を計算
-
-        #勾配法による誤差最小化
-        loss, _ = self.sess.run([self.loss, self.grad_update], feed_dict={
-            self.s: np.float32(np.array(state_batch) / 255.0),
-            self.a: action_batch,
-            self.y: y_batch
-        })
+        #誤差最小化
+        loss, _ = self.sess.run([self.loss, self.grad_update], feed_dict={self.s: np.float32(np.array(state_batch) / 255.0), self.a: action_batch, self.training_data: training_data_batch})
 
     def setup_summary(self):
         episode_total_reward = tf.Variable(0.)
@@ -191,9 +189,9 @@ class Agent():
         episode_avg_loss = tf.Variable(0.)
         tf.summary.scalar(ENV_NAME + '/Average Loss/Episode', episode_avg_loss)
         summary_vars = [episode_total_reward, episode_avg_max_q, episode_duration, episode_avg_loss]
-        summary_placeholders = [tf.placeholder(tf.float32) for _ in xrange(len(summary_vars))]
-        update_ops = [summary_vars[i].assign(summary_placeholders[i]) for i in xrange(len(summary_vars))]
-        summary_op = tf.merge_all_summaries()
+        summary_placeholders = [tf.placeholder(tf.float32) for _ in range(len(summary_vars))]
+        update_ops = [summary_vars[i].assign(summary_placeholders[i]) for i in range(len(summary_vars))]
+        summary_op = tf.summary.merge_all()
         return summary_placeholders, update_ops, summary_op
 
     def load_network(self):
@@ -204,71 +202,64 @@ class Agent():
         else:
             print('Training new network...')
 
-    def get_acction_at_test(self, state):
+    def get_action_at_test(self, state):
         action = self.repeated_action
 
-        if self.t % ACTION_INTERVAL == 0:
+        if self.time % ACTION_INTERVAL == 0:
             if random.random() <= 0.05:
-                action = random.randrange(self.num_actions)
+                action = self.random.randrange(self.num_actions)
             else:
                 action = np.argmax(self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]}))
-            self.repeated_action = action
 
-        self.t += 1
+        self.time += 1
 
         return action
 
     def run(self, state, action, reward, terminal, observation):
         #次の状態を作成
-        next_state = np.appned(state[1:, :, :], observation, axis=0) #stateの末尾行に(次元を保ったまま)observationを追加
+        next_state = np.append(state[:, :, 1:], observation, axis=2)
 
-        #報酬の固定　正は1, 負は-1に
-        reward = np.sign(reward) #np.sign() : 符号を取得する関数
+        #報酬を1, -1でクリッピング
+        reward = np.sign(reward)
 
-        #Replay Memoryに遷移を保存
+        #Replay Memoryへの保存
         self.replay_memory.append((state, action, reward, next_state, terminal))
-        #Replay Memory(deque)が一定数を超えたら、古い遷移から削除
         if len(self.replay_memory) > NUM_REPLAY_MEMORY:
             self.replay_memory.popleft()
 
-        if self.t >INITIAL_REPLAY_SIZE:
-            #Q Networkの学習
-            if self.t % TRAIN_INTERVAL:
+        if self.time > INITIAL_REPLAY_SIZE:
+            if self.time % TRAIN_INTERVAL:
                 self.train_network()
 
-            if self.t % TARGET_UPDATE_INTERVAL == 0:
-                self.sess.run(self.update_target_network)
+        if self.time % TARGET_UPDATE_INTERVAL == 0:
+            self.sess.run(self.update_target_network)
 
-            #ネットワークを保存
-            if self.t % SAVE_INTERVAL == 0:
-                save_path = self.saver.save(self.sess, SAVE_NETWORK_PATH + '/' + ENV_NAME, global_step=(self.t))
-                print('Successfully saved: ' + save_path)
+        #ネットワークを保存
+        if self.time % SAVE_INTERVAL == 0:
+            save_path = self.saver.save(self.sess, SAVE_NETWORK_PATH + '/' + ENV_NAME, global_step=(self.time))
+            print('Successfully saved: ' + save_path)
 
         self.total_reward += reward
         self.total_q_max += np.max(self.q_values.eval(feed_dict={self.s: [np.float32(state / 255.0)]}))
         self.duration += 1
 
         if terminal:
-            # Write summary
-            if self.t >= INITIAL_REPLAY_SIZE:
-                stats = [self.total_reward, self.total_q_max / float(self.duration),
-                        self.duration, self.total_loss / (float(self.duration) / float(TRAIN_INTERVAL))]
-                for i in xrange(len(stats)):
-                    self.sess.run(self.update_ops[i], feed_dict={
-                        self.summary_placeholders[i]: float(stats[i])
-                    })
+            if self.time >= INITIAL_REPLAY_SIZE:
+                states = [self.total_reward, self.total_q_max / float(self.duration), self.duration, self.total_loss / float(self.duration) / float(TRAIN_INTERVAL) ]
+                for i in range(len(states)):
+                    self.sess.run(self.update_ops[i], feed_dict={self.summary_placeholders[i]: float(states[i])})
                 summary_str = self.sess.run(self.summary_op)
                 self.summary_writer.add_summary(summary_str, self.episode + 1)
 
             # Debug
-            if self.t < INITIAL_REPLAY_SIZE:
+            if self.time < INITIAL_REPLAY_SIZE:
                 mode = 'random'
-            elif INITIAL_REPLAY_SIZE <= self.t < INITIAL_REPLAY_SIZE + EXPLORATION_STEPS:
+            elif INITIAL_REPLAY_SIZE <= self.time < INITIAL_REPLAY_SIZE + EXPLORATION_STEPS:
                 mode = 'explore'
             else:
                 mode = 'exploit'
             print('EPISODE: {0:6d} / TIMESTEP: {1:8d} / DURATION: {2:5d} / EPSILON: {3:.5f} / TOTAL_REWARD: {4:3.0f} / AVG_MAX_Q: {5:2.4f} / AVG_LOSS: {6:.5f} / MODE: {7}'.format(
-                self.episode + 1, self.t, self.duration, self.epsilon,
+                self.episode + 1, self.time, self.duration, self.epsilon,
                 self.total_reward, self.total_q_max / float(self.duration),
                 self.total_loss / (float(self.duration) / float(TRAIN_INTERVAL)), mode))
 
@@ -278,15 +269,16 @@ class Agent():
             self.duration = 0
             self.episode += 1
 
-        self.t += 1     #タイムステップ
+        self.time += 1
 
         return next_state
 
-#ゲーム画面を前処理にかける
+
+#FIXME: リサイズの次元の検討
 def preprocess(observation, last_observation):
     processed_observation = np.maximum(observation, last_observation)
-    processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT))*255)
-    return np.reshape(processed_observation, (1, FRAME_WIDTH, FRAME_HEIGHT))    #CNNに入力しやすいようにreshape
+    processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT), mode="constant") * 255)
+    return np.reshape(processed_observation, (FRAME_WIDTH, FRAME_HEIGHT, 1))
 
 
 #大枠
@@ -295,10 +287,10 @@ def main():
     agent = Agent(num_actions=env.action_space.n)
 
     if TRAIN: # Train mode
-        for _ in xrange(NUM_EPISODES):
+        for _ in range(NUM_EPISODES):
             terminal = False #エピソード終了判定
             observation = env.reset() #初期画面を返す
-            for _ in xrange(random.randint(1, NO_OP_STEPS)): #1~30フレーム分なにもしない
+            for _ in range(random.randint(1, NO_OP_STEPS)): #1~30フレーム分なにもしない
                 last_observation = observation
                 #stepが返す値は4つ、　observation(object):環境の情報をもつオブジェクト, reward(float):　前のアクションで得られた報酬, done(bool): エピソードが終了したかどうか, info(dict): デバック用情報
                 observation, _, _, _ =env.step(0) #何もしない行動をして次画面を返す
@@ -312,10 +304,10 @@ def main():
                 state = agent.run(state, action, reward, terminal, processed_observation) #学習を行い次の状態を返す
     else:   #Test mode
         env.monitor.start(ENV_NAME + '-test')
-        for _ in xrange(NUM_EPISODES_AT_TEST):
+        for _ in range(NUM_EPISODES_AT_TEST):
             terminal =False
             observation = env.reset()
-            for _ in xrange(random.randint(1, NO_OP_STEPS)):
+            for _ in range(random.randint(1, NO_OP_STEPS)):
                 last_observation = observation
                 observation, _, _, _ = env.step(0)
             state = agent.get_initial_state(observation, last_observation)
